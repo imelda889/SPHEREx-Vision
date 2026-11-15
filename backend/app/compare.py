@@ -23,6 +23,7 @@ import hashlib
 import io
 import json
 import logging
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -710,8 +711,11 @@ def run_comparison(
         early, late = rec_b, rec_a
 
     warnings: list[str] = []
-    payload_a = fetch_cutout(str(early["access_url"]), ra, dec, size_deg)
-    payload_b = fetch_cutout(str(late["access_url"]), ra, dec, size_deg)
+    with ThreadPoolExecutor(max_workers=2, thread_name_prefix="spherex-cutout") as executor:
+        future_a = executor.submit(fetch_cutout, str(early["access_url"]), ra, dec, size_deg)
+        future_b = executor.submit(fetch_cutout, str(late["access_url"]), ra, dec, size_deg)
+        payload_a = future_a.result()
+        payload_b = future_b.result()
     frame_a = read_cutout(payload_a, str(early["obs_id"]))
     frame_b = read_cutout(payload_b, str(late["obs_id"]))
 

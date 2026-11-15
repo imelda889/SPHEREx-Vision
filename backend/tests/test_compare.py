@@ -7,6 +7,7 @@ scientific validation is done separately on real DR1 observations.
 from __future__ import annotations
 
 import io
+import threading
 from pathlib import Path
 
 import numpy as np
@@ -16,6 +17,7 @@ from astropy.wcs import WCS
 from fastapi.testclient import TestClient
 
 from app import compare, config
+from app import main
 from app.main import app
 
 RA0, DEC0 = 150.0, 2.0
@@ -358,7 +360,13 @@ def test_run_comparison_end_to_end_with_fixtures(isolated_compare, monkeypatch):
     early = make_cutout(image_value=1.0, variance_value=0.01, epsf_sigma=1.6, zodi_value=0.10)
     late = make_cutout(image_value=1.1, variance_value=0.01, epsf_sigma=1.2, zodi_value=0.15)
     payloads = {"A": early, "B": late}
-    monkeypatch.setattr(compare, "fetch_cutout", lambda url, ra, dec, size: payloads[url[-1]])
+    both_started = threading.Barrier(2)
+
+    def fetch(url, ra, dec, size):
+        both_started.wait(timeout=2.0)
+        return payloads[url[-1]]
+
+    monkeypatch.setattr(compare, "fetch_cutout", fetch)
 
     a = rec("A", 3, 60000.0, url="https://irsa.ipac.caltech.edu/A")
     b = rec("B", 3, 60010.0, url="https://irsa.ipac.caltech.edu/B")
@@ -415,6 +423,15 @@ def test_run_comparison_rejects_unit_mismatch(isolated_compare, monkeypatch):
 client = TestClient(app)
 
 
+@pytest.fixture(autouse=True)
+def clear_compare_sia_cache():
+    with main._compare_sia_cache_lock:
+        main._compare_sia_cache.clear()
+    yield
+    with main._compare_sia_cache_lock:
+        main._compare_sia_cache.clear()
+
+
 def test_compare_result_unknown_observation_returns_404(monkeypatch):
     monkeypatch.setattr("app.main.sia.query_sia", lambda *a, **k: [rec("A", 3, 60000.0)])
     r = client.get(
@@ -422,6 +439,46 @@ def test_compare_result_unknown_observation_returns_404(monkeypatch):
         params={"ra": RA0, "dec": DEC0, "obs_id_a": "NOPE", "obs_id_b": "A", "band_a": 3, "band_b": 3},
     )
     assert r.status_code == 404
+
+
+def test_compare_result_reuses_recent_available_query(monkeypatch):
+    ra, dec, radius = 231.123456, -42.654321, 0.05
+    rows = [
+        rec("EARLY", 3, 60000.0, url="https://irsa.ipac.caltech.edu/early.fits"),
+        rec("LATE", 3, 60010.0, url="https://irsa.ipac.caltech.edu/late.fits"),
+    ]
+    calls = []
+
+    def query(collection, query_ra, query_dec, query_radius):
+        calls.append((collection, query_ra, query_dec, query_radius))
+        return rows
+
+    monkeypatch.setattr(main.sia, "query_sia", query)
+    monkeypatch.setattr(main.compare, "run_comparison", lambda *args, **kwargs: {"job_id": "fixture"})
+
+    available = client.get(
+        "/api/compare/available",
+        params={"ra": ra, "dec": dec, "radius_deg": radius, "collection": "spherex_dr1"},
+    )
+    result = client.get(
+        "/api/compare/result",
+        params={
+            "ra": ra,
+            "dec": dec,
+            "size_deg": 0.2,
+            "search_radius_deg": radius,
+            "collection": "spherex_dr1",
+            "obs_id_a": "EARLY",
+            "obs_id_b": "LATE",
+            "band_a": 3,
+            "band_b": 3,
+        },
+    )
+
+    assert available.status_code == 200
+    assert result.status_code == 200
+    assert result.json()["job_id"] == "fixture"
+    assert calls == [("spherex_dr1", ra, dec, radius)]
 
 
 def test_compare_result_rejects_invalid_pair(monkeypatch):

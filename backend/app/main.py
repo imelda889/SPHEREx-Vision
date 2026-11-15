@@ -9,6 +9,7 @@ from __future__ import annotations
 import io
 import json
 import logging
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -28,6 +29,44 @@ from . import tiles
 log = logging.getLogger("spherex_backend")
 
 app = FastAPI(title="SPHEREx Vision data backend", version="1.0.0")
+
+_COMPARE_SIA_CACHE_TTL_S = 300.0
+_COMPARE_SIA_CACHE_MAX_ENTRIES = 32
+_compare_sia_cache: dict[tuple[str, float, float, float], tuple[float, list[dict[str, Any]]]] = {}
+_compare_sia_cache_lock = threading.Lock()
+
+
+def _query_compare_sia(
+    collection: str,
+    ra: float,
+    dec: float,
+    radius_deg: float,
+) -> list[dict[str, Any]]:
+    key = (collection, ra, dec, radius_deg)
+    now = time.monotonic()
+    with _compare_sia_cache_lock:
+        cached = _compare_sia_cache.get(key)
+        if cached and now - cached[0] < _COMPARE_SIA_CACHE_TTL_S:
+            return cached[1]
+        _compare_sia_cache.pop(key, None)
+
+    records = sia.query_sia(collection, ra, dec, radius_deg)
+
+    now = time.monotonic()
+    with _compare_sia_cache_lock:
+        expired = [
+            cached_key
+            for cached_key, (created_at, _) in _compare_sia_cache.items()
+            if now - created_at >= _COMPARE_SIA_CACHE_TTL_S
+        ]
+        for cached_key in expired:
+            del _compare_sia_cache[cached_key]
+        if len(_compare_sia_cache) >= _COMPARE_SIA_CACHE_MAX_ENTRIES:
+            oldest_key = min(_compare_sia_cache, key=lambda cached_key: _compare_sia_cache[cached_key][0])
+            del _compare_sia_cache[oldest_key]
+        _compare_sia_cache[key] = (now, records)
+    return records
+
 
 app.add_middleware(
     CORSMiddleware,
@@ -314,7 +353,7 @@ def compare_available(
     rows for this region/collection.
     """
     try:
-        records = sia.query_sia(collection, ra, dec, radius_deg)
+        records = _query_compare_sia(collection, ra, dec, radius_deg)
     except Exception as exc:  # noqa: BLE001
         log.exception("SIA query failed")
         raise HTTPException(status_code=502, detail=f"SIA query failed: {exc}") from exc
@@ -403,6 +442,7 @@ def compare_result(
     ra: float = Query(..., ge=0.0, lt=360.0),
     dec: float = Query(..., ge=-90.0, le=90.0),
     size_deg: float = Query(config.COMPARE_SIZE_DEG, gt=0.0, le=config.COMPARE_MAX_SIZE_DEG),
+    search_radius_deg: float | None = Query(None, gt=0.0, le=config.MAX_SEARCH_RADIUS_DEG),
     collection: str = Query(config.DEFAULT_COLLECTION, pattern="^(spherex_dr1|spherex_dr1_deep|spherex_qr3|spherex_qr3_deep)$"),
     obs_id_a: str = Query(..., max_length=128),
     obs_id_b: str = Query(..., max_length=128),
@@ -415,9 +455,9 @@ def compare_result(
     An observation ID is not unique on its own: one SIA2 row exists per detector
     band, so the band must be supplied and is validated server-side.
     """
-    radius = max(0.01, size_deg * 0.5)
+    radius = search_radius_deg if search_radius_deg is not None else max(0.01, size_deg * 0.5)
     try:
-        records = sia.query_sia(collection, ra, dec, radius)
+        records = _query_compare_sia(collection, ra, dec, radius)
     except Exception as exc:  # noqa: BLE001
         log.exception("SIA query failed")
         raise HTTPException(status_code=502, detail=f"SIA query failed: {exc}") from exc

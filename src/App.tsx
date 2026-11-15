@@ -1170,6 +1170,7 @@ function App() {
       ra: String(cmpRegion.ra),
       dec: String(cmpRegion.dec),
       size_deg: "0.2",
+      search_radius_deg: String(cmpRegion.radius),
       collection: "spherex_dr1",
       obs_id_a: cmpA,
       obs_id_b: cmpB,
@@ -2016,7 +2017,7 @@ function App() {
                     // Pass normalized coordinates directly to avoid stale closure
                     runRegionSearch(String(normRa.toFixed(5)), String(dec.toFixed(5)), String(clampedR.toFixed(4)));
                   }}
-                  mode="pan"
+                  mode="select"
                 />
                 ) : skyViewMode === "spherex" ? (
                 <SpherexAllSky

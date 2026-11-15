@@ -1,26 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import * as THREE from "three";
 import { OrbitControls } from "three/addons/controls/OrbitControls.js";
-
-// Order-0 HEALPix pixel centers and vertices (nested, nside=1).
-// Source: astropy_healpix, verified 2026-11-14 (Agent A report).
-// vertices: [v0, v1, v2, v3] in (ra, dec) degrees.
-// Vertices in astropy_healpix order: [v0, v1, v2, v3].
-// v0=(0,90) v1=(0,41.81) v2=(45,0) v3=(90,41.81) for ipix 0 (verified 2026-11-15).
-const ORDER0_TILES: Array<{ ipix: number; ra: number; dec: number; verts: Array<[number, number]> }> = [
-  { ipix: 0, ra: 45, dec: 41.8103, verts: [[0, 90], [0, 41.8103], [45, 0], [90, 41.8103]] },
-  { ipix: 1, ra: 135, dec: 41.8103, verts: [[0, 90], [90, 41.8103], [135, 0], [180, 41.8103]] },
-  { ipix: 2, ra: 225, dec: 41.8103, verts: [[180, 90], [180, 41.8103], [225, 0], [270, 41.8103]] },
-  { ipix: 3, ra: 315, dec: 41.8103, verts: [[180, 90], [270, 41.8103], [315, 0], [0, 41.8103]] },
-  { ipix: 4, ra: 0, dec: 0, verts: [[0, 41.8103], [315, 0], [0, -41.8103], [45, 0]] },
-  { ipix: 5, ra: 90, dec: 0, verts: [[90, 41.8103], [45, 0], [90, -41.8103], [135, 0]] },
-  { ipix: 6, ra: 180, dec: 0, verts: [[180, 41.8103], [135, 0], [180, -41.8103], [225, 0]] },
-  { ipix: 7, ra: 270, dec: 0, verts: [[270, 41.8103], [225, 0], [270, -41.8103], [315, 0]] },
-  { ipix: 8, ra: 45, dec: -41.8103, verts: [[45, 0], [0, -41.8103], [0, -90], [90, -41.8103]] },
-  { ipix: 9, ra: 135, dec: -41.8103, verts: [[135, 0], [90, -41.8103], [0, -90], [180, -41.8103]] },
-  { ipix: 10, ra: 225, dec: -41.8103, verts: [[225, 0], [180, -41.8103], [180, -90], [270, -41.8103]] },
-  { ipix: 11, ra: 315, dec: -41.8103, verts: [[315, 0], [270, -41.8103], [180, -90], [0, -41.8103]] },
-];
+import { lonLat2PixNest } from "healpix-ts";
 
 // Wavelengths (µm) from official data_cube_crval3_arr (102 values). Frames 50,51 blank.
 const SPHEREX_WAVELENGTHS: number[] = [
@@ -32,20 +13,14 @@ const SPHEREX_WAVELENGTHS: number[] = [
 const BLANK_FRAMES = new Set([50, 51]);
 const HIPS_ROOT = "https://irsa.ipac.caltech.edu/data/hips/SPHEREx/spherex_allsky_cube";
 const VALID_LAYERS = Array.from({ length: 102 }, (_, i) => i).filter((i) => !BLANK_FRAMES.has(i));
+const ORDER9_NSIDE = 512;
+const ORDER9_PIXELS_PER_TILE = ORDER9_NSIDE * ORDER9_NSIDE;
+const POLAR_CAP_BOUNDARY_DEG = (Math.asin(2 / 3) * 180) / Math.PI;
+const TEXTURE_WIDTH = 2048;
+const TEXTURE_HEIGHT = 1024;
 
 function tileUrl(ipix: number, layer: number): string {
-  const dir = Math.floor(ipix / 10000) * 10000;
   return `${HIPS_ROOT}/Norder0/Dir0/Npix${ipix}_${layer}.png`;
-}
-
-function raDecToVec3(ra: number, dec: number, r = 1): THREE.Vector3 {
-  const raR = (ra * Math.PI) / 180;
-  const decR = (dec * Math.PI) / 180;
-  return new THREE.Vector3(
-    r * Math.cos(decR) * Math.cos(raR),
-    r * Math.cos(decR) * Math.sin(raR),
-    r * Math.sin(decR)
-  );
 }
 
 function vec3ToRaDec(v: THREE.Vector3): { ra: number; dec: number } {
@@ -102,7 +77,7 @@ export function SpherexGlobe3D({
 
     // Camera
     const camera = new THREE.PerspectiveCamera(fov, container.clientWidth / container.clientHeight, 0.1, 100);
-    // Initial view: equatorial, looking at RA ~180, Dec 0 (avoids south pole)
+    // Initial view: equatorial, looking at RA 180, Dec 0 (avoids south pole).
     camera.position.set(3, 0, 0);
     cameraRef.current = camera;
 
@@ -199,146 +174,131 @@ export function SpherexGlobe3D({
       }
     }
 
-    const loader = new THREE.TextureLoader();
-    loader.crossOrigin = "anonymous";
-
-    const loadTile = async (tile: typeof ORDER0_TILES[0]) => {
+    const fetchTileData = async (ipix: number, layer: number): Promise<ImageData | null> => {
+      if (BLANK_FRAMES.has(layer)) return null;
       try {
-        const bitmaps: (ImageBitmap | null)[] = await Promise.all(
-          uniqueLayers.map(async (l) => {
-            if (BLANK_FRAMES.has(l)) return null;
-            const url = tileUrl(tile.ipix, l);
-            try {
-              const res = await fetch(url, { mode: "cors", cache: "force-cache" });
-              if (!res.ok) return null;
-              if (gen !== genRef.current) return null; // stale
-              const blob = await res.blob();
-              if (gen !== genRef.current) return null; // stale
-              return await createImageBitmap(blob);
-            } catch {
-              return null;
-            }
-          })
-        );
-
-        if (gen !== genRef.current) return; // stale generation
-        const bmp0 = bitmaps[0];
-        if (allSkyMode === "rgb" ? bitmaps.some((bitmap) => !bitmap) : !bmp0) return;
-
-        // Create composite canvas
-        const canvas = document.createElement("canvas");
-        canvas.width = 512;
-        canvas.height = 512;
-        const ctx = canvas.getContext("2d", { willReadFrequently: true });
-        if (!ctx) return;
-
-        if (allSkyMode === "rgb") {
-          const shortBmp = bitmaps[uniqueLayers.indexOf(shortLayer)];
-          const medBmp = bitmaps[uniqueLayers.indexOf(medLayer)];
-          const longBmp = bitmaps[uniqueLayers.indexOf(longLayer)];
-          if (!shortBmp || !medBmp || !longBmp) return;
-          const tmpCanvas = document.createElement("canvas");
-          tmpCanvas.width = 512;
-          tmpCanvas.height = 512;
-          const tmpCtx = tmpCanvas.getContext("2d", { willReadFrequently: true })!;
-          const getPixels = (bmp: ImageBitmap) => {
-            tmpCtx.clearRect(0, 0, 512, 512);
-            tmpCtx.drawImage(bmp, 0, 0);
-            return tmpCtx.getImageData(0, 0, 512, 512).data;
-          };
-          const sp = getPixels(shortBmp);
-          const mp = getPixels(medBmp);
-          const lp = getPixels(longBmp);
-          const out = ctx.createImageData(512, 512);
-          for (let i = 0; i < out.data.length; i += 4) {
-            if (
-              sp[i] === 0 || mp[i] === 0 || lp[i] === 0 ||
-              sp[i + 3] === 0 || mp[i + 3] === 0 || lp[i + 3] === 0
-            ) {
-              continue;
-            }
-            out.data[i] = lp[i];
-            out.data[i + 1] = mp[i];
-            out.data[i + 2] = sp[i];
-            out.data[i + 3] = 255;
-          }
-          ctx.putImageData(out, 0, 0);
-        } else {
-          if (bmp0) {
-            ctx.drawImage(bmp0, 0, 0);
-            const image = ctx.getImageData(0, 0, 512, 512);
-            for (let i = 0; i < image.data.length; i += 4) {
-              if (image.data[i] === 0) image.data[i + 3] = 0;
-            }
-            ctx.putImageData(image, 0, 0);
-          }
+        const response = await fetch(tileUrl(ipix, layer), { mode: "cors", cache: "force-cache" });
+        if (!response.ok || gen !== genRef.current) return null;
+        const bitmap = await createImageBitmap(await response.blob());
+        const canvas = new OffscreenCanvas(512, 512);
+        const context = canvas.getContext("2d", { willReadFrequently: true });
+        if (!context) {
+          bitmap.close();
+          throw new Error("Could not read the SPHEREx HiPS tile.");
         }
-
-        // Create texture from canvas
-        const texture = new THREE.CanvasTexture(canvas);
-        texture.needsUpdate = true;
-        texture.minFilter = THREE.LinearFilter;
-        texture.magFilter = THREE.LinearFilter;
-
-        // Build quad geometry from 4 vertices
-        // verts: [v0, v1, v2, v3] = (v0=bottom-right, v1=top-right, v2=top-left, v3=bottom-left) in image space
-        // UV: v3→(0,0), v0→(1,0), v1→(1,1), v2→(0,1)
-        const verts = tile.verts;
-        const positions: number[] = [];
-        const uvs: number[] = [];
-        const indices = [0, 1, 2, 0, 2, 3];
-
-        // v3, v0, v1, v2 order for quad
-        const quadVerts = [verts[3], verts[0], verts[1], verts[2]];
-        const quadUVs = [[0, 0], [1, 0], [1, 1], [0, 1]];
-
-        for (let i = 0; i < 4; i++) {
-          const v = quadVerts[i];
-          const vec = raDecToVec3(v[0], v[1], 1.001);
-          positions.push(vec.x, vec.y, vec.z);
-          uvs.push(quadUVs[i][0], quadUVs[i][1]);
-        }
-
-        const geo = new THREE.BufferGeometry();
-        geo.setAttribute("position", new THREE.Float32BufferAttribute(positions, 3));
-        geo.setAttribute("uv", new THREE.Float32BufferAttribute(uvs, 2));
-        geo.setIndex(indices);
-
-        const mat = new THREE.MeshBasicMaterial({
-          map: texture,
-          side: THREE.DoubleSide,
-          transparent: true,
-          depthWrite: false,
-        });
-        const mesh = new THREE.Mesh(geo, mat);
-        tileGroup.add(mesh);
-
-        // Store texture for cleanup
-        tilesRef.current.set(`${tile.ipix}`, texture);
-      } catch (e) {
-        console.error(`Tile ${tile.ipix} failed:`, e);
+        context.drawImage(bitmap, 0, 0, 512, 512);
+        const data = context.getImageData(0, 0, 512, 512);
+        bitmap.close();
+        return data;
+      } catch (cause) {
+        if (gen === genRef.current) console.error(`SPHEREx tile ${ipix}, layer ${layer} failed:`, cause);
+        return null;
       }
     };
 
-    // Load all 12 tiles
-    Promise.all(ORDER0_TILES.map(loadTile)).then(() => {
-      if (gen !== genRef.current) return; // stale generation, discard
+    const renderGlobeTexture = async () => {
+      const tileLayers = await Promise.all(
+        Array.from({ length: 12 }, (_, ipix) =>
+          Promise.all(uniqueLayers.map((layer) => fetchTileData(ipix, layer))),
+        ),
+      );
+      if (gen !== genRef.current) return;
+
+      const availableTiles = tileLayers.filter((layers) => layers.every(Boolean)).length;
+      const canvas = document.createElement("canvas");
+      canvas.width = TEXTURE_WIDTH;
+      canvas.height = TEXTURE_HEIGHT;
+      const context = canvas.getContext("2d");
+      if (!context) {
+        setLoading(false);
+        setError("This browser could not create the canvas needed to render the SPHEREx globe.");
+        return;
+      }
+
+      const image = context.createImageData(TEXTURE_WIDTH, TEXTURE_HEIGHT);
+      for (let y = 0; y < TEXTURE_HEIGHT; y++) {
+        if (gen !== genRef.current) return;
+        const dec = 90 - ((y + 0.5) / TEXTURE_HEIGHT) * 180;
+        for (let x = 0; x < TEXTURE_WIDTH; x++) {
+          const ra = (180 + ((x + 0.5) / TEXTURE_WIDTH) * 360) % 360;
+          let lon = ra > 180 ? ra - 360 : ra;
+          if (dec >= POLAR_CAP_BOUNDARY_DEG && (lon === 0 || lon === 180)) lon += 1e-9;
+
+          const nestedPixel = lonLat2PixNest(ORDER9_NSIDE, lon, dec);
+          const tileIndex = Math.floor(nestedPixel / ORDER9_PIXELS_PER_TILE);
+          const nestedSubpixel = nestedPixel % ORDER9_PIXELS_PER_TILE;
+          let sx = 0;
+          let sy = 0;
+          for (let bit = 0; bit < 9; bit++) {
+            sx |= ((nestedSubpixel >> (2 * bit)) & 1) << bit;
+            sy |= ((nestedSubpixel >> (2 * bit + 1)) & 1) << bit;
+          }
+
+          const sourceIndex = (sx * ORDER9_NSIDE + sy) * 4;
+          const layers = tileLayers[tileIndex];
+          const targetIndex = (y * TEXTURE_WIDTH + x) * 4;
+          if (allSkyMode === "rgb") {
+            const shortData = layers[uniqueLayers.indexOf(shortLayer)]?.data;
+            const medData = layers[uniqueLayers.indexOf(medLayer)]?.data;
+            const longData = layers[uniqueLayers.indexOf(longLayer)]?.data;
+            if (!shortData || !medData || !longData) continue;
+            const blue = shortData[sourceIndex];
+            const green = medData[sourceIndex];
+            const red = longData[sourceIndex];
+            if (red === 0 || green === 0 || blue === 0) continue;
+            image.data[targetIndex] = red;
+            image.data[targetIndex + 1] = green;
+            image.data[targetIndex + 2] = blue;
+          } else {
+            const data = layers[uniqueLayers.indexOf(singleLayer)]?.data;
+            const value = data?.[sourceIndex];
+            if (value === undefined || value === 0) continue;
+            image.data[targetIndex] = value;
+            image.data[targetIndex + 1] = value;
+            image.data[targetIndex + 2] = value;
+          }
+          image.data[targetIndex + 3] = 255;
+        }
+      }
+
+      if (gen !== genRef.current) return;
+      context.putImageData(image, 0, 0);
+      const texture = new THREE.CanvasTexture(canvas);
+      texture.minFilter = THREE.LinearFilter;
+      texture.magFilter = THREE.LinearFilter;
+      texture.wrapS = THREE.RepeatWrapping;
+
+      const geometry = new THREE.SphereGeometry(1.001, 128, 64);
+      geometry.rotateX(Math.PI / 2);
+      const material = new THREE.MeshBasicMaterial({
+        map: texture,
+        side: THREE.DoubleSide,
+        transparent: true,
+        depthWrite: false,
+      });
+      tileGroup.add(new THREE.Mesh(geometry, material));
+      tilesRef.current.set("equirectangular", texture);
+
       setLoading(false);
-      const availableTiles = tileGroup.children.length;
-      if (availableTiles < ORDER0_TILES.length) {
-        setStatus(`SPHEREx DR1 3D Globe — ${availableTiles}/12 official tiles loaded`);
+      setStatus(
+        allSkyMode === "rgb"
+          ? `SPHEREx DR1 3D Globe — False-Colour RGB (B=${SPHEREX_WAVELENGTHS[shortLayer].toFixed(3)} G=${SPHEREX_WAVELENGTHS[medLayer].toFixed(3)} R=${SPHEREX_WAVELENGTHS[longLayer].toFixed(3)} µm) — ${availableTiles}/12 tiles`
+          : `SPHEREx DR1 3D Globe — Single Band ${SPHEREX_WAVELENGTHS[singleLayer].toFixed(3)} µm — ${availableTiles}/12 tiles`
+      );
+      if (availableTiles < 12) {
         setError(
           availableTiles === 0
             ? "Official SPHEREx HiPS tiles are unavailable. Try again later; no substitute data is shown."
             : `Only ${availableTiles} of 12 official SPHEREx HiPS tiles loaded. The globe is incomplete; no substitute data is shown.`,
         );
-        return;
       }
-      setStatus(
-        allSkyMode === "rgb"
-          ? `SPHEREx DR1 3D Globe — False-Colour RGB (B=${SPHEREX_WAVELENGTHS[shortLayer].toFixed(3)} G=${SPHEREX_WAVELENGTHS[medLayer].toFixed(3)} R=${SPHEREX_WAVELENGTHS[longLayer].toFixed(3)} µm) — 12/12 tiles`
-          : `SPHEREx DR1 3D Globe — Single Band ${SPHEREX_WAVELENGTHS[singleLayer].toFixed(3)} µm — 12/12 tiles`
-      );
+    };
+
+    void renderGlobeTexture().catch((cause: unknown) => {
+      if (gen !== genRef.current) return;
+      console.error("Could not render the SPHEREx globe:", cause);
+      setLoading(false);
+      setError("The SPHEREx globe could not be rendered. Try again.");
     });
 
     return () => {
@@ -411,13 +371,12 @@ export function SpherexGlobe3D({
     };
   }, [mode, onSelect, onCursor]);
 
-  // Cursor tracking for center/fov (already in animation loop via onCenter/onFov)
-  // But we need to call them. Let's add a separate effect.
+  // The visible center of the opaque globe is the point nearest the camera.
   useEffect(() => {
     const camera = cameraRef.current;
     if (!camera) return;
     const interval = setInterval(() => {
-      const dir = new THREE.Vector3(0, 0, -1).applyQuaternion(camera.quaternion);
+      const dir = camera.position.clone().normalize();
       onCenter(vec3ToRaDec(dir));
       const dist = camera.position.length();
       const sphereAngularDiam = dist >= 1 ? (2 * Math.asin(Math.min(1, 1 / dist)) * 180) / Math.PI : 180;
@@ -476,10 +435,10 @@ export function SpherexGlobe3D({
         ) : (
           <>Single Wavelength {SPHEREX_WAVELENGTHS[singleLayer].toFixed(3)} µm — Official SPHEREx DR1 HiPS (3D Globe)</>
         )}
-        <span style={{ display: "block", fontSize: 8, opacity: 0.7 }}>Official IRSA HiPS tiles on an unvalidated 3D face projection. Visual overview only; use Coverage Map or IRSA for precise feature positions.</span>
+        <span style={{ display: "block", fontSize: 8, opacity: 0.7 }}>Official SPHEREx HiPS data reprojected using HEALPix coordinates. Click a sky position to select it.</span>
       </div>
-      <div role="note" style={{ position: "absolute", bottom: 90, left: 10, maxWidth: "calc(100% - 20px)", background: "rgba(4,8,15,0.92)", border: "1px solid #e0a45f", borderRadius: 6, padding: "6px 9px", fontSize: 10, color: "#f1f5f9", zIndex: 4 }}>
-        Globe tile positions are not precision-validated. Click selection is disabled; use Coverage Map or IRSA for sky-position searches.
+      <div role="note" style={{ position: "absolute", bottom: 90, left: 10, maxWidth: "calc(100% - 20px)", background: "rgba(4,8,15,0.92)", border: "1px solid #26374b", borderRadius: 6, padding: "6px 9px", fontSize: 10, color: "#f1f5f9", zIndex: 4 }}>
+        Click the globe to select a sky position. Drag to rotate; scroll to zoom.
       </div>
       <div style={{ position: "absolute", top: 10, right: 10, zIndex: 3 }}>
         <a href={`https://irsa.ipac.caltech.edu/irsaviewer?api=hips&uri=${encodeURIComponent(HIPS_ROOT)}&ra=180&dec=0&sr=180d`} target="_blank" rel="noopener noreferrer" className="text-button" style={{ fontSize: 9, background: "rgba(4,8,15,0.88)", border: "1px solid #26374b", borderRadius: 999, padding: "4px 10px" }}>

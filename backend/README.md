@@ -20,6 +20,10 @@ The static preview is served separately (e.g. `http://127.0.0.1:5173`).
 
 ## Reliability
 
+- Compare searches reuse successful SIA metadata for five minutes for the same
+  collection, coordinates, and radius. The result request keeps that search
+  radius and downloads the two cutouts concurrently; first-time network access
+  still depends on IRSA availability.
 - SIA metadata queries are bounded by `SPHEREX_SIA_TIMEOUT_S` (default 60 s).
   Transient upstream failures get at most three attempts total, with 250 ms
   and 500 ms backoff delays. Identical in-flight searches are shared.
