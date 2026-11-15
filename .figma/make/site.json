@@ -1,0 +1,14 @@
+{
+  "title": "SPHEREx Vision",
+  "icons": {
+    "icon": "/sphere.png"
+  },
+  "description": "An interactive astronomy explorer for visualizing the SPHEREx infrared sky, comparing observations, and investigating potential astronomical changes.",
+  "robots": {
+    "index": true
+  },
+  "accessibility": {
+    "addBypassLinks": false,
+    "ignoreReducedMotion": false
+  }
+}

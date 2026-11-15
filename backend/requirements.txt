@@ -1,0 +1,16 @@
+# M1/M2A/M2B/M2C dependencies — each justified in backend/README.md.
+# No pyvo (deferred), no sep (not needed), no SExtractor.
+fastapi>=0.115
+uvicorn>=0.30
+astroquery>=0.4.7   # IRSA SIA2/TAP; recommended by official SPHEREx docs
+astropy>=7.0        # FITS I/O, WCS, coordinates, units, convolution (also an astroquery dep)
+pillow>=10.0        # PNG tile and comparison rendering
+httpx>=0.27         # cutout downloads + FastAPI TestClient
+pytest>=8.0         # test runner
+
+# M2B temporal comparison.
+reproject>=0.13     # WCS-based reprojection onto the reference pixel grid
+scipy>=1.11         # erf() for pixel-integrated PSF matching kernels (reproject dep)
+
+# M2C candidate detection.
+photutils>=3.1      # detect_sources/deblend_sources/SourceCatalog segmentation

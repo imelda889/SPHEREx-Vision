@@ -1,0 +1,20 @@
+services:
+  web:
+    build:
+      context: .
+      dockerfile: Dockerfile.dev
+    ports:
+      - "8443:8443"
+    volumes:
+      # Bind mount keeps every host edit instantly visible in the container,
+      # so Vite HMR refreshes the browser. (This also makes `sync` rules for
+      # the same paths redundant — Compose skips watching bind-mounted paths.)
+      - .:/app
+      - /app/node_modules
+    develop:
+      watch:
+        # Deps / lockfile changes cannot hot-reload: rebuild the image.
+        - action: rebuild
+          path: ./package.json
+        - action: rebuild
+          path: ./package-lock.json
